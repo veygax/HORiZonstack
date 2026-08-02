@@ -1,3 +1,10 @@
+#include "src/common.h"
+#include "src/config.h"
+#include <stdio.h>
+#include <string.h>
+#include <sys/system_properties.h>
+#include <sys/utsname.h>
+
 struct hz_dev {
     const char *label;
     const char *code;
@@ -233,3 +240,74 @@ static const struct hz_table hz_tables[] = {
     { "4.19.325-cip128-st12-g4b63ca9fd613", "", { 0x1077df8, 0x9d7bbc, 0x9d7c58, 0x9d7d0c, 0x9d82d8, 0x9d8324, 0x9d8490, 0x9d8510, 0x9d8624, 0x1c3b758, 0x2dc3c4, 0x2dc4e4, 0x2dc700, 0x2dc880, 0x26fbc8, 0x22f7cc, 0x22f7d4, 0x1b4b580, 0x1cfad80, 0x145b1a0, 0x145aca0, 0xfd29c0, 0x1b5a818, 0xfb8f70, 0x7820c, 0x1b4b3ae, 0x1d33ff9, 0x1d49849, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0 }, &dev_seacliff },
     { "4.19.325-cip128-st12-g634385c6b2f6", "", { 0x1077df8, 0x9d7b5c, 0x9d7bf8, 0x9d7cac, 0x9d8278, 0x9d82c4, 0x9d8430, 0x9d84b0, 0x9d85c4, 0x1c3b758, 0x2dc3ac, 0x2dc4cc, 0x2dc6e8, 0x2dc868, 0x26fbb0, 0x22f7b4, 0x22f7bc, 0x1b4b580, 0x1cfad80, 0x145ab80, 0x145a680, 0xfd29c0, 0x1b5a818, 0xfb8f70, 0x7820c, 0x1b4b3ae, 0x1d33ff9, 0x1d49849, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0 }, &dev_seacliff },
 };
+
+/* hz_table.off[] -> struct ksym_config field mapping (eureka rows). */
+static const int hz_off_to_ksym[][2] = {
+    { 0,  offsetof(struct ksym_config, ashmem_fops_off) },
+    { 9,  offsetof(struct ksym_config, ashmem_misc_fops_off) },
+    { 17, offsetof(struct ksym_config, init_task_off) },
+    { 18, offsetof(struct ksym_config, root_task_group_off) },
+    { 19, offsetof(struct ksym_config, security_hook_heads_off) },
+    { 20, offsetof(struct ksym_config, kmalloc_caches_off) },
+    { 21, offsetof(struct ksym_config, anon_pipe_buf_ops_off) },
+    { 26, offsetof(struct ksym_config, selinux_enforcing_off) },
+    { 27, offsetof(struct ksym_config, slide_sysctl_bootid_off) },
+    { 28, offsetof(struct ksym_config, configfs_read_file_off) },
+    { 30, offsetof(struct ksym_config, configfs_write_bin_file_off) },
+    { 31, offsetof(struct ksym_config, copy_splice_read_off) },
+    { 32, offsetof(struct ksym_config, noop_llseek_off) },
+    { 34, offsetof(struct ksym_config, ashmem_read_iter_off) },
+    { 35, offsetof(struct ksym_config, ashmem_ioctl_off) },
+    { 36, offsetof(struct ksym_config, ashmem_compat_ioctl_off) },
+    { 37, offsetof(struct ksym_config, ashmem_mmap_off) },
+    { 38, offsetof(struct ksym_config, ashmem_open_off) },
+    { 39, offsetof(struct ksym_config, ashmem_release_off) },
+    { 40, offsetof(struct ksym_config, ashmem_show_fdinfo_off) },
+};
+
+int hz_apply_table(void)
+{
+    char release[128] = { 0 };
+    char incremental[128] = { 0 };
+    char product[128] = { 0 };
+    struct utsname uts;
+    if (uname(&uts) == 0) {
+        snprintf(release, sizeof(release), "%s", uts.release);
+    }
+    __system_property_get("ro.build.version.incremental", incremental);
+    __system_property_get("ro.product.device", product);
+
+    const struct hz_table *hit = NULL;
+    for (size_t i = 0; i < sizeof(hz_tables) / sizeof(hz_tables[0]); i++) {
+        const struct hz_table *t = &hz_tables[i];
+        if (strcmp(t->release, release) != 0) {
+            continue;
+        }
+        if (t->incremental[0]) {
+            if (strcmp(t->incremental, incremental) != 0) {
+                continue;
+            }
+        } else if (t->dev == &dev_hollywood &&
+                   !strstr(product, "hollywood")) {
+            continue;
+        } else if (t->dev == &dev_seacliff &&
+                   !strstr(product, "seacliff")) {
+            continue;
+        }
+        hit = t;
+        break;
+    }
+    if (!hit || hit->dev != &dev_eureka) {
+        pr_warning("hz table: no eureka match for %s/%s (product %s)\n",
+                   release, incremental, product);
+        return 0;
+    }
+
+    for (size_t i = 0; i < sizeof(hz_off_to_ksym) / sizeof(hz_off_to_ksym[0]); i++) {
+        int src = hz_off_to_ksym[i][0];
+        int dst = hz_off_to_ksym[i][1];
+        *(uint64_t *)((char *)&g_ksym + dst) = hit->off[src];
+    }
+    pr_info("hz table: applied eureka %s/%s offsets\n", release, incremental);
+    return 1;
+}
